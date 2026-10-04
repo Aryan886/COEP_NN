@@ -541,5 +541,6 @@ def place_orders_crowd(game_state, team_history):
 
 
 def place_orders(game_state, team_history):
-    return place_orders_crowd(game_state, team_history)
+    """Use the validated baseline while P1 remains an evaluation candidate."""
+    return place_orders_baseline(game_state, team_history)
 

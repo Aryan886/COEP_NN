@@ -1,4 +1,4 @@
-"""Price forecasts and a simple, budget-valid trading baseline."""
+"""Price forecasts and crowd-aware integer trading allocations."""
 
 import math
 import sys
@@ -49,6 +49,21 @@ FEATURE_NAMES = (
 )
 MODEL_PATH = Path(__file__).with_name("model.npz")
 DEFAULT_RATIO_LIMIT = 2.5
+OPPONENT_COUNT = 20
+FLOW_DECAY = 0.75
+FLOW_PRIOR_STRENGTH = 4.0
+UNALIGNED_CONFIDENCE = 0.5
+FLOW_WEIGHTS = (0.50, 0.35, 0.15)
+SIGNAL_SIDE_SHARE = 0.80
+LIQUIDITY_MULTIPLIERS = (0.7, 1.0, 1.6)
+REFERENCE_LIQUIDITY = {
+    "quantum_dynamics": 50.0,
+    "byte_stream": 60.0,
+    "gold_trust": 40.0,
+    "metro_rail": 30.0,
+    "agro_futures": 35.0,
+    "solar_grid": 45.0,
+}
 _model = None
 _model_loaded = False
 
@@ -215,36 +230,35 @@ def predict_market(recent_history):
     return predictions
 
 
-def place_orders(game_state, team_history):
-    """Allocate the supplied budget proportionally to forecast changes (P0)."""
-    orders = {asset: 0 for asset in ASSETS}
+def _order_inputs(game_state):
+    """Validate public inputs and abstain when the latest price is missing."""
     if not isinstance(game_state, dict):
         print("Invalid game_state: expected a dictionary", file=sys.stderr)
-        return orders
+        return 0, {}
     budget = game_state.get("trade_budget")
     assets = game_state.get("assets")
     if isinstance(budget, bool) or not isinstance(budget, Integral) or budget < 0:
         print(f"Invalid trade budget: {budget!r}", file=sys.stderr)
-        return orders
+        return 0, {}
     if not isinstance(assets, dict):
         print("Invalid game_state.assets: expected a dictionary", file=sys.stderr)
-        return orders
+        return 0, {}
     if budget == 0:
-        return orders
+        return 0, {}
 
     recent_history = {}
     for asset in ASSETS:
         asset_state = assets.get(asset)
         if not isinstance(asset_state, dict):
             print(f"Missing asset state for {asset}", file=sys.stderr)
-            return orders
+            return 0, {}
         history = asset_state.get("recent_prices", [])
         if history is not None:
             try:
                 history[-20:]
             except (TypeError, KeyError) as error:
                 print(f"Invalid price history for {asset}: {error}", file=sys.stderr)
-                return orders
+                return 0, {}
         recent_history[asset] = history
 
     predictions = predict_market(recent_history)
@@ -258,7 +272,17 @@ def place_orders(game_state, team_history):
             change = predictions[asset] - current_price
             if math.isfinite(change) and change != 0:
                 signals[asset] = change
-    total_signal = sum(abs(change) for change in signals.values())
+    return int(budget), signals
+
+
+def proportional_orders(signals, budget):
+    """P0: stable largest-remainder allocation, with zero for zero signals."""
+    orders = {asset: 0 for asset in ASSETS}
+    largest_signal = max((abs(change) for change in signals.values()), default=0.0)
+    if budget == 0 or largest_signal == 0:
+        return orders
+    weights = {asset: abs(change) / largest_signal for asset, change in signals.items()}
+    total_signal = sum(weights.values())
     if total_signal == 0:
         return orders
 
@@ -266,7 +290,7 @@ def place_orders(game_state, team_history):
     used = 0
     for asset in ASSETS:
         change = signals.get(asset, 0.0)
-        exact_size = budget * abs(change) / total_signal
+        exact_size = budget * weights.get(asset, 0.0) / total_signal
         size = math.floor(exact_size)
         orders[asset] = int(math.copysign(size, change)) if size else 0
         used += size
@@ -278,4 +302,245 @@ def place_orders(game_state, team_history):
     for _, asset in fractions[: budget - used]:
         orders[asset] += 1 if signals[asset] > 0 else -1
     return orders
+
+
+def place_orders_baseline(game_state, team_history):
+    budget, signals = _order_inputs(game_state)
+    return proportional_orders(signals, budget)
+
+
+def _volume_number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def estimate_opponent_flow(game_state, team_history, budget):
+    """Shrink paired past volumes toward Astra's neutral 20-opponent prior."""
+    prior = OPPONENT_COUNT * budget / (2 * len(ASSETS))
+    own_records = {}
+    duplicates = set()
+    if team_history is None:
+        team_history = []
+    if not isinstance(team_history, (list, tuple)):
+        print("Invalid team_history: using unaligned volume estimates", file=sys.stderr)
+        team_history = []
+    for record in team_history:
+        if not isinstance(record, dict):
+            continue
+        round_number = record.get("round")
+        if isinstance(round_number, bool) or not isinstance(round_number, Integral):
+            continue
+        if round_number in own_records:
+            duplicates.add(round_number)
+        own_records[round_number] = record.get("orders", {})
+    for round_number in duplicates:
+        del own_records[round_number]
+
+    current_round = game_state.get("round")
+    valid_round = isinstance(current_round, Integral) and not isinstance(current_round, bool)
+    flows = {}
+    for asset in ASSETS:
+        state = game_state["assets"][asset]
+        buys = state.get("recent_buy_volume", [])
+        sells = state.get("recent_sell_volume", [])
+        if buys is None or sells is None:
+            buys, sells = [], []
+        try:
+            if len(buys) != len(sells):
+                print(f"Unpaired volume histories for {asset}; using neutral prior", file=sys.stderr)
+                buys, sells = [], []
+            buys, sells = buys[-20:], sells[-20:]
+        except (TypeError, KeyError) as error:
+            print(f"Invalid volume history for {asset}: {error}", file=sys.stderr)
+            buys, sells = [], []
+
+        count = len(buys)
+        # The harness ends both contiguous volume arrays at current_round - 1.
+        # Require matching, contiguous own round IDs before using that mapping.
+        aligned = valid_round and current_round >= count and all(
+            number in own_records for number in range(current_round - count, current_round)
+        )
+        weight_sum = 0.0
+        squared_weight_sum = 0.0
+        weighted_buys = 0.0
+        weighted_sells = 0.0
+        weighted_confidence = 0.0
+        for position, (buy_value, sell_value) in enumerate(zip(buys, sells)):
+            buy = _volume_number(buy_value)
+            sell = _volume_number(sell_value)
+            if buy is None or sell is None:
+                continue
+            confidence = UNALIGNED_CONFIDENCE
+            opponent_buy = buy * OPPONENT_COUNT / (OPPONENT_COUNT + 1)
+            opponent_sell = sell * OPPONENT_COUNT / (OPPONENT_COUNT + 1)
+            if aligned:
+                round_number = current_round - count + position
+                own_orders = own_records[round_number]
+                own_order = own_orders.get(asset) if isinstance(own_orders, dict) else None
+                if isinstance(own_order, Integral) and not isinstance(own_order, bool):
+                    corrected_buy = buy - max(own_order, 0)
+                    corrected_sell = sell - max(-own_order, 0)
+                    tolerance = 1e-8 * max(1.0, buy, sell, abs(own_order))
+                    if min(corrected_buy, corrected_sell) >= -tolerance:
+                        opponent_buy = max(0.0, corrected_buy)
+                        opponent_sell = max(0.0, corrected_sell)
+                        confidence = 1.0
+                    else:
+                        print(
+                            f"Own order exceeds aggregate volume for {asset} round {round_number}; "
+                            "using unaligned estimate",
+                            file=sys.stderr,
+                        )
+            age = count - 1 - position
+            weight = FLOW_DECAY ** age
+            weight_sum += weight
+            squared_weight_sum += weight * weight
+            weighted_buys += weight * opponent_buy
+            weighted_sells += weight * opponent_sell
+            weighted_confidence += weight * confidence
+
+        if weight_sum:
+            effective_count = weight_sum * weight_sum / squared_weight_sum
+            confidence = weighted_confidence / weight_sum
+            share = effective_count / (effective_count + FLOW_PRIOR_STRENGTH) * confidence
+            buy = share * weighted_buys / weight_sum + (1 - share) * prior
+            sell = share * weighted_sells / weight_sum + (1 - share) * prior
+            flows[asset] = (buy, sell)
+        else:
+            flows[asset] = (prior, prior)
+
+    total = sum(buy + sell for buy, sell in flows.values())
+    limit = OPPONENT_COUNT * budget
+    if total > limit and total > 0:
+        scale = limit / total
+        flows = {asset: (buy * scale, sell * scale) for asset, (buy, sell) in flows.items()}
+    return flows
+
+
+def build_scenarios(signals, flows, budget):
+    """Return nine fixed (buy, sell, liquidity, weight) worlds per asset."""
+    prior = OPPONENT_COUNT * budget / (2 * len(ASSETS))
+    largest = max((abs(value) for value in signals.values()), default=0.0)
+    weights = {asset: abs(value) / largest for asset, value in signals.items()} if largest else {}
+    total_weight = sum(weights.values())
+    scenarios = {}
+    for asset in ASSETS:
+        buy, sell = flows[asset]
+        if total_weight:
+            signal_total = OPPONENT_COUNT * budget * weights.get(asset, 0.0) / total_weight
+            buy_share = SIGNAL_SIDE_SHARE if signals.get(asset, 0.0) > 0 else 1 - SIGNAL_SIDE_SHARE
+            signal_buy = signal_total * buy_share
+            signal_sell = signal_total * (1 - buy_share)
+        else:
+            signal_buy, signal_sell = prior, prior
+        worlds = ((buy, sell), (signal_buy, signal_sell), (sell, buy))
+        scenarios[asset] = []
+        for (world_buy, world_sell), world_weight in zip(worlds, FLOW_WEIGHTS):
+            for multiplier in LIQUIDITY_MULTIPLIERS:
+                liquidity = 0.6 * REFERENCE_LIQUIDITY[asset] * multiplier
+                scenarios[asset].append(
+                    (world_buy, world_sell, liquidity, world_weight / len(LIQUIDITY_MULTIPLIERS))
+                )
+    return scenarios
+
+
+def score_order(order, change, opponent_buy, opponent_sell, liquidity):
+    """Profit without the common P&L scale; buys win dominant-side ties."""
+    values = (change, opponent_buy, opponent_sell, liquidity)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Order scenario contains a non-finite value")
+    if min(opponent_buy, opponent_sell) < 0:
+        raise ValueError("Opponent buy and sell volumes must be nonnegative")
+    if order == 0:
+        return 0.0
+    buy = opponent_buy + max(order, 0)
+    sell = opponent_sell + max(-order, 0)
+    dominant = max(buy, sell)
+    # Match the organizer harness's defensive treatment of nonpositive liquidity.
+    discount = min(1.0, liquidity / dominant) if liquidity > 0 else 1.0
+    our_side_dominant = (order > 0 and buy >= sell) or (order < 0 and sell > buy)
+    return order * change * (discount if our_side_dominant else 1.0)
+
+
+def _better_utility(candidate, current):
+    if current == -math.inf:
+        return candidate != -math.inf
+    tolerance = 1e-10 * max(1.0, abs(candidate), abs(current))
+    return candidate > current + tolerance
+
+
+def optimize_orders(utilities, budget):
+    """Exact separable integer allocation; ties prefer less total exposure."""
+    if isinstance(budget, bool) or not isinstance(budget, Integral) or budget < 0:
+        raise ValueError("Optimizer budget must be a nonnegative integer")
+    assets = list(utilities)
+    previous = [-math.inf] * (budget + 1)
+    previous[0] = 0.0
+    choices = []
+    for asset in assets:
+        table = utilities[asset]
+        if table.get(0) != 0 or not all(math.isfinite(value) for value in table.values()):
+            raise ValueError(f"Utilities for {asset} must be finite and include zero utility at zero")
+        candidates = sorted(table, key=lambda order: (abs(order), order))
+        current = [-math.inf] * (budget + 1)
+        selected = [0] * (budget + 1)
+        for exposure, previous_utility in enumerate(previous):
+            if previous_utility == -math.inf:
+                continue
+            for order in candidates:
+                next_exposure = exposure + abs(order)
+                if next_exposure > budget:
+                    continue
+                utility = previous_utility + table[order]
+                if _better_utility(utility, current[next_exposure]):
+                    current[next_exposure] = utility
+                    selected[next_exposure] = order
+        previous = current
+        choices.append(selected)
+
+    best_exposure = 0
+    for exposure in range(1, budget + 1):
+        if _better_utility(previous[exposure], previous[best_exposure]):
+            best_exposure = exposure
+    orders = {}
+    for position in range(len(assets) - 1, -1, -1):
+        order = int(choices[position][best_exposure])
+        orders[assets[position]] = order
+        best_exposure -= abs(order)
+    return {asset: orders[asset] for asset in assets}
+
+
+def crowd_orders(game_state, team_history, budget, signals):
+    if budget == 0 or not signals:
+        return {asset: 0 for asset in ASSETS}
+    flows = estimate_opponent_flow(game_state, team_history, budget)
+    scenarios = build_scenarios(signals, flows, budget)
+    utilities = {}
+    for asset in ASSETS:
+        table = {0: 0.0}
+        if asset in signals:
+            for order in range(-budget, budget + 1):
+                if order:
+                    table[order] = sum(
+                        weight * score_order(order, signals[asset], buy, sell, liquidity)
+                        for buy, sell, liquidity, weight in scenarios[asset]
+                    )
+        utilities[asset] = table
+    return optimize_orders(utilities, budget)
+
+
+def place_orders_crowd(game_state, team_history):
+    """Astra P1: uncertain opponent flow, nine scenarios, exact budget DP."""
+    budget, signals = _order_inputs(game_state)
+    return crowd_orders(game_state, team_history, budget, signals)
+
+
+def place_orders(game_state, team_history):
+    """Use the validated baseline while P1 remains an evaluation candidate."""
+    return place_orders_baseline(game_state, team_history)
 

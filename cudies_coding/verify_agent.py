@@ -274,8 +274,11 @@ class AllocationTests(unittest.TestCase):
         self.assertGreaterEqual(orders[ASSETS[0]], 0)
         self.assertLessEqual(orders[ASSETS[1]], 0)
         self.assertEqual(orders, agent.crowd_orders(state, [], 14, signals))
+        state["assets"][ASSETS[0]]["recent_prices"] = [None, float("nan")]
+        self.assertEqual(agent.place_orders_crowd(state, [])[ASSETS[0]], 0)
         state["trade_budget"] = 0
         self.assertEqual(agent.place_orders(state, []), {asset: 0 for asset in ASSETS})
+        self.assertEqual(agent.place_orders_crowd(state, []), {asset: 0 for asset in ASSETS})
 
 
 def run_policy_match(seed, field, policy, liquidity_scale=1.0):
