@@ -1,0 +1,13 @@
+# Core dependencies required to run the starter kit
+pandas
+numpy
+scikit-learn
+joblib
+
+# Optional dependencies (uncomment if you plan to use them in your models)
+# xgboost
+# lightgbm
+# torch
+# torchvision
+# torchaudio
+# tensorflow
